@@ -1,0 +1,8 @@
+# Compiled binary
+/hypertail
+
+# Test binaries
+*.test
+
+# Coverage output
+*.out
