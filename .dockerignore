@@ -1,17 +1,6 @@
-# Compiled binary (built inside the image)
-/hypertail
-
-# Test binaries and coverage
-*.test
-*.out
-
-# VCS and tooling
 .git
 .gitignore
-.claude
-
-# Docs not needed for the build
+tailscale-state
+*.log
+*.tmp
 README.md
-LICENSE
-Dockerfile
-.dockerignore

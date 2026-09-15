@@ -109,58 +109,6 @@ git clone https://...      # so does this
 3. The local proxy accepts requests and dials targets **through the tsnet
    node**, so all egress takes the exit node's route.
 
-## Docker
-
-### Build
-
-```sh
-docker build -t hypertail .
-```
-
-### Run
-
-The image binds the proxy to `0.0.0.0:8080` and stores tsnet state in
-`/var/lib/hypertail` by default, so you only need to supply `-exit-node`.
-Publish the port and mount a volume so you don't have to re-authenticate on
-every restart:
-
-```sh
-docker run --rm -it \
-  -p 127.0.0.1:8080:8080 \
-  -v hypertail-state:/var/lib/hypertail \
-  hypertail -exit-node us-server
-```
-
-> **First run — authentication.** `tsnet` prints a Tailscale login URL to the
-> container logs. Watch for it and open it to add the node to your tailnet:
->
-> ```sh
-> docker logs -f <container>
-> ```
->
-> Thanks to the mounted volume, subsequent runs reconnect automatically.
-
-Then point your tools at the published port (note the `http://` scheme — the
-proxy itself speaks plain HTTP and tunnels HTTPS via `CONNECT`):
-
-```sh
-curl -x http://127.0.0.1:8080 https://api.ipify.org
-```
-
-Any flag can be overridden on the command line (a later value wins), e.g. to
-change the listen port inside the container:
-
-```sh
-docker run --rm -it \
-  -p 127.0.0.1:9090:9090 \
-  -v hypertail-state:/var/lib/hypertail \
-  hypertail -exit-node us-server -listen 0.0.0.0:9090
-```
-
-> **Networking note.** `tsnet` uses userspace WireGuard, so no `--cap-add` or
-> `/dev/net/tun` is required — only outbound network access for Tailscale to
-> connect.
-
 ## Development
 
 Run the test suite (includes end-to-end HTTP and CONNECT proxy tests):

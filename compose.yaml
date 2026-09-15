@@ -1,0 +1,29 @@
+services:
+  hypertail:
+    build: .
+    container_name: hypertail
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./tailscale-state:/var/lib/hypertail
+
+    command:
+      - -listen=0.0.0.0:8080
+      - -exit-node=barbados-proxy.tail0c919.ts.net
+      - -state-dir=/var/lib/hypertail
+      - -health-listen=0.0.0.0:8081
+      - -health-interval=15s
+      # After 4 consecutive failed checks (~1 min) the process exits non-zero
+      # and `restart: unless-stopped` brings it back with a fresh tsnet node.
+      - -unhealthy-exit-after=4
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+    restart: unless-stopped

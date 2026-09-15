@@ -2,14 +2,244 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 )
+
+func runningStatus(exitOnline bool) *ipnstate.Status {
+	return &ipnstate.Status{
+		BackendState: ipn.Running.String(),
+		ExitNodeStatus: &ipnstate.ExitNodeStatus{
+			ID:     "nodeid-1",
+			Online: exitOnline,
+		},
+	}
+}
+
+// TestMonitorCheck covers the states the watchdog must distinguish: a healthy
+// node, a disconnected backend, and the stale-exit-node case that does not heal
+// on its own and so must trigger a rebind.
+func TestMonitorCheck(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       *ipnstate.Status
+		statusErr    error
+		rebindErr    error
+		wantHealthy  bool
+		wantRebind   bool
+		wantContains string
+	}{
+		{
+			name:        "running with online exit node",
+			status:      runningStatus(true),
+			wantHealthy: true,
+		},
+		{
+			name:         "status call fails",
+			statusErr:    errors.New("boom"),
+			wantContains: "Status: boom",
+		},
+		{
+			name:         "backend not running",
+			status:       &ipnstate.Status{BackendState: ipn.NeedsLogin.String()},
+			wantContains: "backend state is \"NeedsLogin\"",
+		},
+		{
+			name:         "exit node offline triggers rebind",
+			status:       runningStatus(false),
+			wantRebind:   true,
+			wantContains: "rebound to",
+		},
+		{
+			name:         "exit node missing triggers rebind",
+			status:       &ipnstate.Status{BackendState: ipn.Running.String()},
+			wantRebind:   true,
+			wantContains: "exit node is not set",
+		},
+		{
+			name:         "rebind failure is reported",
+			status:       runningStatus(false),
+			rebindErr:    errors.New("no peer"),
+			wantRebind:   true,
+			wantContains: "rebinding failed: no peer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rebound := false
+			m := &monitor{
+				exitNode: "exit-1",
+				interval: time.Second,
+				status: func(context.Context) (*ipnstate.Status, error) {
+					return tt.status, tt.statusErr
+				},
+				rebind: func(context.Context) error {
+					rebound = true
+					return tt.rebindErr
+				},
+			}
+
+			reason := m.check(context.Background())
+
+			if tt.wantHealthy {
+				if reason != "" {
+					t.Fatalf("check() = %q, want healthy (empty)", reason)
+				}
+			} else if reason == "" {
+				t.Fatalf("check() = healthy, want a failure reason")
+			}
+			if tt.wantContains != "" && !strings.Contains(reason, tt.wantContains) {
+				t.Errorf("check() = %q, want it to contain %q", reason, tt.wantContains)
+			}
+			if rebound != tt.wantRebind {
+				t.Errorf("rebind called = %v, want %v", rebound, tt.wantRebind)
+			}
+		})
+	}
+}
+
+// TestMonitorRunExitsAfterConsecutiveFailures verifies the self-termination
+// path that lets `restart: unless-stopped` recycle a wedged container.
+func TestMonitorRunExitsAfterConsecutiveFailures(t *testing.T) {
+	m := &monitor{
+		exitNode: "exit-1",
+		interval: time.Millisecond,
+		status: func(context.Context) (*ipnstate.Status, error) {
+			return nil, errors.New("down")
+		},
+		rebind: func(context.Context) error { return nil },
+	}
+	m.setHealthy()
+
+	failed := make(chan int, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go m.run(ctx, 3, failed)
+
+	select {
+	case n := <-failed:
+		if n != 3 {
+			t.Errorf("failure count = %d, want 3", n)
+		}
+	case <-ctx.Done():
+		t.Fatal("run() did not report failure before the deadline")
+	}
+}
+
+// TestMonitorRunRecovers verifies that a transient failure does not latch: once
+// checks pass again the monitor reports healthy and resets the failure count.
+func TestMonitorRunRecovers(t *testing.T) {
+	var healthy atomic.Bool
+
+	m := &monitor{
+		exitNode: "exit-1",
+		interval: time.Millisecond,
+		status: func(context.Context) (*ipnstate.Status, error) {
+			if healthy.Load() {
+				return runningStatus(true), nil
+			}
+			return nil, errors.New("down")
+		},
+		rebind: func(context.Context) error { return nil },
+	}
+	m.setHealthy()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// exitAfter=0 means the loop never self-terminates.
+	go m.run(ctx, 0, make(chan int, 1))
+
+	// Wait for at least one failed check.
+	deadline := time.After(5 * time.Second)
+	for {
+		if ok, _, _, n := m.snapshot(); !ok && n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("monitor never went unhealthy")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	healthy.Store(true)
+
+	for {
+		if ok, _, _, n := m.snapshot(); ok && n == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("monitor never recovered")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// TestHealthHandler checks the status codes and payload Docker's HEALTHCHECK
+// relies on.
+func TestHealthHandler(t *testing.T) {
+	m := &monitor{exitNode: "exit-1", interval: time.Second}
+	m.setHealthy()
+
+	srv := httptest.NewServer(m.healthHandler())
+	defer srv.Close()
+
+	get := func() (int, map[string]any) {
+		resp, err := http.Get(srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz: %v", err)
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		return resp.StatusCode, body
+	}
+
+	code, body := get()
+	if code != http.StatusOK {
+		t.Errorf("healthy status = %d, want 200", code)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %v, want ok", body["status"])
+	}
+	if body["exit_node"] != "exit-1" {
+		t.Errorf("exit_node = %v, want exit-1", body["exit_node"])
+	}
+
+	m.setUnhealthy("exit node offline")
+
+	code, body = get()
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("unhealthy status = %d, want 503", code)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", body["status"])
+	}
+	if body["reason"] != "exit node offline" {
+		t.Errorf("reason = %v, want %q", body["reason"], "exit node offline")
+	}
+	if body["consecutive_failures"] != float64(1) {
+		t.Errorf("consecutive_failures = %v, want 1", body["consecutive_failures"])
+	}
+}
 
 func TestRemoveHopByHopHeaders(t *testing.T) {
 	h := http.Header{}
