@@ -1,16 +1,35 @@
-FROM golang:1.26 AS build
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+# ---- build stage ----
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+
+# Cache module downloads separately from the source.
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -o hypertail .
+# Static binary so it runs in a minimal final image.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/hypertail .
 
-FROM alpine:latest
+# ---- runtime stage ----
+FROM alpine:3.20
 
-COPY --from=build /app/hypertail /usr/local/bin/hypertail
+# CA certificates for verifying upstream TLS targets.
+RUN apk add --no-cache ca-certificates
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:8081/healthz || exit 1
+COPY --from=build /out/hypertail /usr/local/bin/hypertail
 
-ENTRYPOINT ["hypertail"]
+# tsnet state is persisted here; mount a volume to keep it across restarts.
+RUN mkdir -p /var/lib/hypertail
+VOLUME /var/lib/hypertail
+
+# Proxy port (bound to 0.0.0.0 below so it is reachable from the host).
+EXPOSE 8080
+
+# Stable defaults baked in; pass -exit-node (and override others if needed) at
+# `docker run`. Go's flag parser lets a later value win, so e.g. an extra
+# -listen on the command line overrides the default here.
+ENTRYPOINT ["hypertail", "-listen", "0.0.0.0:8080", "-state-dir", "/var/lib/hypertail"]

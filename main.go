@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,13 +10,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -27,9 +24,6 @@ func main() {
 	hostname := flag.String("hostname", "hypertail", "Tailscale hostname for this node")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
-	healthListen := flag.String("health-listen", "", "Address to serve the /healthz endpoint on (empty disables it)")
-	healthInterval := flag.Duration("health-interval", 15*time.Second, "How often to check tsnet connectivity and exit node binding")
-	unhealthyExitAfter := flag.Int("unhealthy-exit-after", 0, "Exit with a non-zero status after this many consecutive failed checks, so a container supervisor can restart the process (0 disables)")
 	flag.Parse()
 
 	if *exitNode == "" {
@@ -72,36 +66,6 @@ func main() {
 	}
 	log.Printf("Exit node set to %q", *exitNode)
 
-	// The watchdog owns the liveness state that both /healthz and the
-	// self-termination path read.
-	mon := &monitor{
-		status:   lc.Status,
-		rebind:   func(ctx context.Context) error { return setExitNode(ctx, lc, *exitNode) },
-		exitNode: *exitNode,
-		interval: *healthInterval,
-	}
-	mon.setHealthy()
-
-	runCtx, stopRun := context.WithCancel(ctx)
-	defer stopRun()
-
-	failed := make(chan int, 1)
-	go mon.run(runCtx, *unhealthyExitAfter, failed)
-
-	var healthSrv *http.Server
-	if *healthListen != "" {
-		healthSrv = &http.Server{
-			Addr:    *healthListen,
-			Handler: mon.healthHandler(),
-		}
-		go func() {
-			log.Printf("Health endpoint listening on %s/healthz", *healthListen)
-			if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("health server error: %v", err)
-			}
-		}()
-	}
-
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return srv.Dial(ctx, network, addr)
@@ -128,32 +92,12 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	exitCode := 0
-	select {
-	case <-sigCh:
-		log.Println("Shutting down...")
-	case n := <-failed:
-		log.Printf("Exiting after %d consecutive failed health checks so the supervisor can restart us", n)
-		exitCode = 1
-	}
-
-	stopRun()
-	shutdownCtx, stopShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer stopShutdown()
+	<-sigCh
+	log.Println("Shutting down...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown: %v", err)
-	}
-	if healthSrv != nil {
-		if err := healthSrv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("health server shutdown: %v", err)
-		}
-	}
-
-	if exitCode != 0 {
-		// srv.Close is deferred; run it before bypassing the deferred chain.
-		srv.Close()
-		os.Exit(exitCode)
 	}
 }
 
@@ -198,162 +142,6 @@ func setExitNode(ctx context.Context, lc *local.Client, exitNodeSel string) erro
 	}
 
 	return nil
-}
-
-// monitor periodically verifies that the tsnet node is still connected to the
-// control plane and that the configured exit node is still bound and online.
-//
-// tsnet reconnects to the control plane on its own, but the exit node binding
-// does not heal itself: setExitNode resolves the selector to a concrete node ID
-// once at startup, so if the exit node leaves the netmap and comes back with a
-// new ID, prefs keep pointing at a peer that no longer exists and egress stays
-// broken indefinitely. The watchdog re-resolves the selector when that happens.
-type monitor struct {
-	// status and rebind are injected so the check loop can be tested without a
-	// live tailnet; in production they wrap the tsnet local client.
-	status   func(context.Context) (*ipnstate.Status, error)
-	rebind   func(context.Context) error
-	exitNode string
-	interval time.Duration
-
-	mu       sync.Mutex
-	healthy  bool
-	reason   string
-	since    time.Time
-	failures int
-}
-
-func (m *monitor) setHealthy() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.healthy {
-		m.since = time.Now()
-	}
-	m.healthy = true
-	m.reason = ""
-	m.failures = 0
-}
-
-// setUnhealthy records a failed check and returns the number of consecutive
-// failures so far.
-func (m *monitor) setUnhealthy(reason string) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.healthy {
-		m.since = time.Now()
-	}
-	m.healthy = false
-	m.reason = reason
-	m.failures++
-	return m.failures
-}
-
-func (m *monitor) snapshot() (healthy bool, reason string, since time.Time, failures int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.healthy, m.reason, m.since, m.failures
-}
-
-// check reports why the node is unhealthy, or "" when everything is in order.
-// It attempts to repair a stale exit node binding before giving up.
-func (m *monitor) check(ctx context.Context) string {
-	st, err := m.status(ctx)
-	if err != nil {
-		return fmt.Sprintf("Status: %v", err)
-	}
-
-	if st.BackendState != ipn.Running.String() {
-		return fmt.Sprintf("backend state is %q, want %q", st.BackendState, ipn.Running.String())
-	}
-
-	if st.ExitNodeStatus != nil && st.ExitNodeStatus.Online {
-		return ""
-	}
-
-	// Either prefs lost the exit node entirely or the bound peer went offline.
-	// Re-resolving the selector picks up a node that rejoined under a new ID.
-	what := "exit node is not set"
-	if st.ExitNodeStatus != nil {
-		what = fmt.Sprintf("exit node %s is offline", st.ExitNodeStatus.ID)
-	}
-	log.Printf("Health check: %s, re-resolving %q", what, m.exitNode)
-
-	retryCtx, cancel := context.WithTimeout(ctx, m.interval)
-	defer cancel()
-	if err := m.rebind(retryCtx); err != nil {
-		return fmt.Sprintf("%s, and rebinding failed: %v", what, err)
-	}
-
-	// EditPrefs has been accepted, but the binding only counts as recovered
-	// once the node reports the exit node online again. Report the current
-	// state as unhealthy and let the next tick confirm the repair.
-	return fmt.Sprintf("%s, rebound to %q, waiting for it to come online", what, m.exitNode)
-}
-
-// run drives the check loop. When exitAfter is greater than zero and that many
-// checks fail consecutively, the count is sent on failed so main can exit and
-// let the container supervisor restart the process.
-func (m *monitor) run(ctx context.Context, exitAfter int, failed chan<- int) {
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		if reason := m.check(ctx); reason != "" {
-			n := m.setUnhealthy(reason)
-			log.Printf("Health check failed (%d consecutive): %s", n, reason)
-			if exitAfter > 0 && n >= exitAfter {
-				select {
-				case failed <- n:
-				default:
-				}
-				return
-			}
-			continue
-		}
-
-		if healthy, _, _, _ := m.snapshot(); !healthy {
-			log.Printf("Health check recovered")
-		}
-		m.setHealthy()
-	}
-}
-
-func (m *monitor) healthHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		healthy, reason, since, failures := m.snapshot()
-
-		body := struct {
-			Status            string `json:"status"`
-			ExitNode          string `json:"exit_node"`
-			Reason            string `json:"reason,omitempty"`
-			SinceRFC3339      string `json:"since"`
-			ConsecutiveErrors int    `json:"consecutive_failures"`
-		}{
-			Status:            "ok",
-			ExitNode:          m.exitNode,
-			Reason:            reason,
-			SinceRFC3339:      since.UTC().Format(time.RFC3339),
-			ConsecutiveErrors: failures,
-		}
-
-		code := http.StatusOK
-		if !healthy {
-			body.Status = "unhealthy"
-			code = http.StatusServiceUnavailable
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		json.NewEncoder(w).Encode(body)
-	})
-	return mux
 }
 
 type forwardProxy struct {
