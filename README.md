@@ -111,24 +111,29 @@ git clone https://...      # so does this
 
 ## Docker
 
-### Build
-
-```sh
-docker build -t hypertail .
-```
+The image is built and published to GHCR by Actions (multi-arch: amd64 +
+arm64). Its version tracks the bundled `tailscale.com` module: Dependabot
+opens a PR bumping go.mod, and merging it triggers a new build. The deployed
+container uses the `latest` tag, so Watchtower (or a manual `docker compose
+pull && docker compose up -d`) keeps it current.
 
 ### Run
 
-The image binds the proxy to `0.0.0.0:8080` and stores tsnet state in
-`/var/lib/hypertail` by default, so you only need to supply `-exit-node`.
-Publish the port and mount a volume so you don't have to re-authenticate on
-every restart:
+`compose.yaml` in this repo is the deployment used on the Raspberry Pi (exit
+node, state volume, health endpoint included):
+
+```sh
+docker compose up -d
+```
+
+Or without compose (the image binds the proxy to `0.0.0.0:8080` and stores
+tsnet state in `/var/lib/hypertail`, so you only need to supply `-exit-node`):
 
 ```sh
 docker run --rm -it \
   -p 127.0.0.1:8080:8080 \
   -v hypertail-state:/var/lib/hypertail \
-  hypertail -exit-node us-server
+  ghcr.io/wuxriff/hypertail:latest -exit-node us-server
 ```
 
 > **First run — authentication.** `tsnet` prints a Tailscale login URL to the
@@ -148,14 +153,21 @@ curl -x http://127.0.0.1:8080 https://api.ipify.org
 ```
 
 Any flag can be overridden on the command line (a later value wins), e.g. to
-change the listen port inside the container:
+change the listen port inside the container.
+
+### Health
+
+Run with `-health-listen=0.0.0.0:8081` (as `compose.yaml` does) and the
+container serves a passive status endpoint:
 
 ```sh
-docker run --rm -it \
-  -p 127.0.0.1:9090:9090 \
-  -v hypertail-state:/var/lib/hypertail \
-  hypertail -exit-node us-server -listen 0.0.0.0:9090
+curl http://127.0.0.1:8081/healthz
 ```
+
+It reports the tsnet backend state and whether the exit node is bound and
+online, answering 200 or 503 with a reason. It only observes: reconnection and
+re-auth are tsnet's own job. The Dockerfile's `HEALTHCHECK` uses it to show
+`(healthy)`/`(unhealthy)` in `docker ps`; nothing is restarted automatically.
 
 > **Networking note.** `tsnet` uses userspace WireGuard, so no `--cap-add` or
 > `/dev/net/tun` is required — only outbound network access for Tailscale to

@@ -10,8 +10,11 @@
 .gitignore
 .claude
 
-# Docs not needed for the build
+# Docs, CI and local deployment not needed for the build
 README.md
 LICENSE
 Dockerfile
 .dockerignore
+compose.yaml
+.github
+.agents

@@ -1,0 +1,20 @@
+services:
+  hypertail:
+    container_name: hypertail
+    # Private image from GHCR, built by Actions when the tailscale.com version
+    # is bumped in go.mod (Dependabot opens the PR). No version pinned here -
+    # Watchtower on the host updates the container from the latest tag.
+    image: ghcr.io/wuxriff/hypertail:latest
+    environment:
+      - TS_DEBUG_ALWAYS_USE_DERP=true
+    ports:
+      - "8080:8080"
+      - "8081:8081" # /healthz: curl http://<host>:8081/healthz
+    volumes:
+      - ./tailscale-state:/var/lib/hypertail
+    command:
+      - -listen=0.0.0.0:8080
+      - -exit-node=barbados-proxy.tail0c919.ts.net
+      - -state-dir=/var/lib/hypertail
+      - -health-listen=0.0.0.0:8081
+    restart: unless-stopped

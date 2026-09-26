@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +12,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
+
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 )
 
 func TestRemoveHopByHopHeaders(t *testing.T) {
@@ -159,5 +166,95 @@ func TestHandleConnect(t *testing.T) {
 	}
 	if string(buf) != "pong" {
 		t.Errorf("tunnel echo = %q, want pong", buf)
+	}
+}
+
+// TestHealthzHandler covers the codes and payload Docker's HEALTHCHECK and
+// external monitoring rely on: 200 only while the backend is Running and the
+// exit node is online, 503 with a reason otherwise.
+func TestHealthzHandler(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     *ipnstate.Status
+		statusErr  error
+		wantCode   int
+		wantErrEq  string
+	}{
+		{
+			name:     "running with online exit node",
+			status:   runningStatus(true),
+			wantCode: http.StatusOK,
+		},
+		{
+			name:      "exit node offline",
+			status:    runningStatus(false),
+			wantCode:  http.StatusServiceUnavailable,
+			wantErrEq: "exit node is offline",
+		},
+		{
+			name:      "exit node not set",
+			status:    &ipnstate.Status{BackendState: ipn.Running.String()},
+			wantCode:  http.StatusServiceUnavailable,
+			wantErrEq: "exit node is not set",
+		},
+		{
+			name:      "backend not running",
+			status:    &ipnstate.Status{BackendState: ipn.NeedsLogin.String()},
+			wantCode:  http.StatusServiceUnavailable,
+			wantErrEq: `backend state is "NeedsLogin", want "Running"`,
+		},
+		{
+			name:      "status call fails",
+			statusErr: errors.New("boom"),
+			wantCode:  http.StatusServiceUnavailable,
+			wantErrEq: "Status: boom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := healthzHandler(func(context.Context) (*ipnstate.Status, error) {
+				return tt.status, tt.statusErr
+			}, "exit-1", time.Now())
+
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+
+			resp, err := http.Get(srv.URL + "/healthz")
+			if err != nil {
+				t.Fatalf("GET /healthz: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantCode {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantCode)
+			}
+
+			var body map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["exit_node"] != "exit-1" {
+				t.Errorf("exit_node = %v, want exit-1", body["exit_node"])
+			}
+			if tt.wantErrEq != "" && body["error"] != tt.wantErrEq {
+				t.Errorf("error = %v, want %q", body["error"], tt.wantErrEq)
+			}
+			if tt.wantCode == http.StatusOK {
+				if body["status"] != "ok" {
+					t.Errorf("status = %v, want ok", body["status"])
+				}
+				if body["exit_node_online"] != true {
+					t.Errorf("exit_node_online = %v, want true", body["exit_node_online"])
+				}
+			}
+		})
+	}
+}
+
+func runningStatus(exitOnline bool) *ipnstate.Status {
+	return &ipnstate.Status{
+		BackendState:   ipn.Running.String(),
+		ExitNodeStatus: &ipnstate.ExitNodeStatus{ID: "nodeid-1", Online: exitOnline},
 	}
 }

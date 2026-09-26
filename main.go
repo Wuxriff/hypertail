@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -24,6 +26,7 @@ func main() {
 	hostname := flag.String("hostname", "hypertail", "Tailscale hostname for this node")
 	stateDir := flag.String("state-dir", "", "Directory to store Tailscale state")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
+	healthListen := flag.String("health-listen", "", "Address to serve the /healthz status endpoint on (empty disables)")
 	flag.Parse()
 
 	if *exitNode == "" {
@@ -65,6 +68,17 @@ func main() {
 		log.Fatalf("failed to set exit node: %v", err)
 	}
 	log.Printf("Exit node set to %q", *exitNode)
+
+	// Passive status endpoint: reports what the tailnet sees, repairs nothing.
+	if *healthListen != "" {
+		started := time.Now()
+		go func() {
+			log.Printf("Health endpoint listening on %s/healthz", *healthListen)
+			if err := http.ListenAndServe(*healthListen, healthzHandler(lc.Status, *exitNode, started)); err != nil {
+				log.Fatalf("health server error: %v", err)
+			}
+		}()
+	}
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -142,6 +156,65 @@ func setExitNode(ctx context.Context, lc *local.Client, exitNodeSel string) erro
 	}
 
 	return nil
+}
+
+// healthzStatus is the JSON shape served at /healthz.
+type healthzStatus struct {
+	Status         string `json:"status"`
+	BackendState   string `json:"backend_state,omitempty"`
+	ExitNode       string `json:"exit_node"`
+	ExitNodeOnline *bool  `json:"exit_node_online,omitempty"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
+	Error          string `json:"error,omitempty"`
+}
+
+// healthzHandler reports passive liveness: it reads the tsnet state on every
+// request and never attempts to repair anything. It answers 200 while the
+// backend is Running and the exit node is bound and online, 503 with a reason
+// otherwise. Reconnection is tsnet's job; this endpoint only exposes what the
+// tailnet sees so the host (docker ps, curl, uptime monitors) can observe it.
+func healthzHandler(status func(context.Context) (*ipnstate.Status, error), exitNodeSel string, started time.Time) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		body := healthzStatus{
+			Status:        "ok",
+			ExitNode:      exitNodeSel,
+			UptimeSeconds: int64(time.Since(started).Seconds()),
+		}
+		code := http.StatusOK
+
+		st, err := status(ctx)
+		switch {
+		case err != nil:
+			body.Status = "unhealthy"
+			body.Error = fmt.Sprintf("Status: %v", err)
+			code = http.StatusServiceUnavailable
+		default:
+			body.BackendState = st.BackendState
+			if st.ExitNodeStatus != nil {
+				online := st.ExitNodeStatus.Online
+				body.ExitNodeOnline = &online
+			}
+			switch {
+			case st.BackendState != ipn.Running.String():
+				body.Error = fmt.Sprintf("backend state is %q, want %q", st.BackendState, ipn.Running.String())
+			case st.ExitNodeStatus == nil:
+				body.Error = "exit node is not set"
+			case !st.ExitNodeStatus.Online:
+				body.Error = "exit node is offline"
+			}
+			if body.Error != "" {
+				body.Status = "unhealthy"
+				code = http.StatusServiceUnavailable
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(body)
+	})
 }
 
 type forwardProxy struct {
